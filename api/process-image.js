@@ -1,109 +1,103 @@
 const sharp = require("sharp");
 
-// ---------------------------------------------------------------------------
-// Screened Image Detection Helper
-// ---------------------------------------------------------------------------
-
 async function isScreenedImage(buffer) {
-  const size = 512;
   const { data, info } = await sharp(buffer)
-    .resize(size, size, { fit: "fill" })
-    .grayscale()
+    .resize(800, 800, { fit: "inside" })
+    .removeAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
   const width = info.width;
   const height = info.height;
+  const channels = info.channels;
 
-  const rowMeans = new Float64Array(height);
-  const colMeans = new Float64Array(width);
-
+  // --- CHECK 1: The Black Bezel ---
+  let darkEdgePixels = 0;
+  const edgeThreshold = 20;
   for (let y = 0; y < height; y++) {
-    let sum = 0;
-    for (let x = 0; x < width; x++) {
-      sum += data[y * width + x];
+    const leftPixel = data[y * width * channels];
+    const rightPixel = data[(y * width + width - 1) * channels];
+    if (leftPixel < edgeThreshold) darkEdgePixels++;
+    if (rightPixel < edgeThreshold) darkEdgePixels++;
+  }
+  const isBezelDetected = darkEdgePixels / (height * 2) > 0.4;
+
+  // --- CHECK 2: The Glare ---
+  let whitePixels = 0;
+  for (let i = 0; i < data.length; i += channels) {
+    if (data[i] > 240 && data[i + 1] > 240 && data[i + 2] > 240) {
+      whitePixels++;
     }
-    rowMeans[y] = sum / width;
   }
+  const isGlareDetected = whitePixels / (width * height) > 0.015;
 
-  for (let x = 0; x < width; x++) {
-    let sum = 0;
-    for (let y = 0; y < height; y++) {
-      sum += data[y * width + x];
-    }
-    colMeans[x] = sum / height;
+  // --- CHECK 3: Sharpness (Blur) ---
+  let sum = 0,
+    sumSq = 0;
+  for (let i = 1; i < data.length - channels; i += channels) {
+    const val = data[i] - (data[i - channels] + data[i + channels]) / 2;
+    sum += val;
+    sumSq += val * val;
   }
+  const mean = sum / (data.length / channels);
+  const variance = sumSq / (data.length / channels) - mean * mean;
+  const isBlurry = variance < 200;
 
-  const rowDiffs = [];
-  for (let i = 1; i < height; i++) {
-    rowDiffs.push(rowMeans[i] - rowMeans[i - 1]);
+  // --- CHECK 4: Local Pixel Variance (NEW) ---
+  // We check how often adjacent pixels change drastically.
+  // A screen grid creates tiny "steps" (pixelation) that real photos don't have.
+  let localVarianceCount = 0;
+  for (let i = 1; i < data.length - channels; i += channels) {
+    // Compare pixel to its left neighbor
+    const diff = Math.abs(data[i] - data[i - channels]);
+    // If the difference is between 10 and 50, it's likely a screen pixel step
+    if (diff > 10 && diff < 50) localVarianceCount++;
   }
+  const pixelStepRatio = localVarianceCount / (data.length / channels);
+  // If more than 15% of pixels have this "step" texture, it's a screen
+  const isPixelated = pixelStepRatio > 0.15;
 
-  const colDiffs = [];
-  for (let i = 1; i < width; i++) {
-    colDiffs.push(colMeans[i] - colMeans[i - 1]);
-  }
+  // --- FINAL DECISION ---
+  // It is a screen if:
+  // 1. It has a black bezel
+  // OR
+  // 2. It has glare AND is blurry
+  // OR
+  // 3. It is blurry AND pixelated (catches cropped screen photos)
+  const isScreened =
+    isBezelDetected ||
+    (isGlareDetected && isBlurry) ||
+    (isBlurry && isPixelated);
 
-  function computeAutocorrelationPeakScore(arr) {
-    const n = arr.length;
-    let mean = 0;
-    for (let i = 0; i < n; i++) mean += arr[i];
-    mean /= n;
-
-    let variance = 0;
-    for (let i = 0; i < n; i++) {
-      variance += (arr[i] - mean) ** 2;
-    }
-    if (variance === 0) return 0;
-
-    let maxAutoCorr = 0;
-    for (let lag = 2; lag <= 16; lag++) {
-      let cov = 0;
-      for (let i = 0; i < n - lag; i++) {
-        cov += (arr[i] - mean) * (arr[i + lag] - mean);
-      }
-      const autoCorr = cov / variance;
-      if (autoCorr > maxAutoCorr) {
-        maxAutoCorr = autoCorr;
-      }
-    }
-    return maxAutoCorr;
-  }
-
-  const rowScore = computeAutocorrelationPeakScore(rowDiffs);
-  const colScore = computeAutocorrelationPeakScore(colDiffs);
-
-  const score = (rowScore + colScore) / 2;
-  const isScreened = score > 0.8;
-
-  return { isScreened, score };
+  return {
+    isScreened,
+    debug: {
+      isBezelDetected,
+      isGlareDetected,
+      variance,
+      pixelStepRatio,
+    },
+  };
 }
 
 module.exports = async (req, res) => {
-  // 1. Ensure it's a POST request
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed. Use POST." });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   try {
-    // 2. Extract the image buffer from the request body
     const { imageBuffer } = req.body;
-    if (!imageBuffer) {
-      return res
-        .status(400)
-        .json({ error: "No image buffer provided in request body." });
-    }
+    if (!imageBuffer) return res.status(400).json({ error: "No buffer." });
 
-    // 3. Convert base64 string back into a Node.js Buffer
     const buffer = Buffer.from(imageBuffer, "base64");
+    const result = await isScreenedImage(buffer);
 
-    // 4. Run your screening check function
-    const isScreened = await isScreenedImage(buffer);
+    console.log(
+      `[Detection] Screened: ${result.isScreened} | Bezel: ${result.debug.isBezelDetected} | Glare: ${result.debug.isGlareDetected} | Var: ${result.debug.variance.toFixed(2)} | PixelRatio: ${result.debug.pixelStepRatio.toFixed(4)}`,
+    );
 
-    // 5. Return the result
     return res.status(200).json({
       success: true,
-      isScreenedImage: isScreened,
+      isScreenedImage: result.isScreened,
+      debug: result.debug,
     });
   } catch (error) {
     console.error("Serverless execution error:", error);

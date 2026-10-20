@@ -2,6 +2,7 @@
   "name": "vercel-image-api",
   "version": "1.0.0",
   "dependencies": {
+    "fft-js": "^0.0.12",
     "sharp": "^0.33.0",
     "vercel": "^63.1.2"
   }
